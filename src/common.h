@@ -162,6 +162,9 @@
 #ifndef LEGACY_RT_MUTEX_WAITER
 #define LEGACY_RT_MUTEX_WAITER 0
 #endif
+#ifndef LEGACY_FOPS
+#define LEGACY_FOPS 0
+#endif
 #ifndef COMPACT_RT_MUTEX_WAITER
 #define COMPACT_RT_MUTEX_WAITER 0
 #endif
@@ -181,6 +184,10 @@
   P0_DATA_ALIAS_CONST(SLIDE_NFULNL_LOGGER_OBJECT_IMAGE)
 #define SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR \
   P0_DATA_ALIAS_CONST(SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR_IMAGE)
+#ifdef SLIDE_RANDOM_TABLE_BOOT_ID_ENTRY_IMAGE
+#define SLIDE_RANDOM_TABLE_BOOT_ID_ENTRY \
+  P0_DATA_ALIAS_CONST(SLIDE_RANDOM_TABLE_BOOT_ID_ENTRY_IMAGE)
+#endif
 #ifndef SLIDE_WAITER_TREE_LEFT
 #define SLIDE_WAITER_TREE_LEFT SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR
 #endif
@@ -368,6 +375,8 @@ void setup_kernelsnitch(void);
 int kernelsnitch_collisions_ready(void);
 void run_kernelsnitch_bruteforce(void);
 uintptr_t cleanup_kernelsnitch(void);
+/* Defined by kernelsnitch/futex_hash.h in the KernelSnitch translation unit. */
+extern unsigned long futex_hashsize;
 void close_ctx_memfds(struct mm_ctx *ctx);
 void free_ctx_storage(struct mm_ctx *ctx);
 void cleanup_page_prepare_state(void);

